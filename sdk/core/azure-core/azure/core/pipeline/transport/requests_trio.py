@@ -23,16 +23,19 @@
 # IN THE SOFTWARE.
 #
 # --------------------------------------------------------------------------
-import asyncio
 from collections.abc import AsyncIterator
 import functools
 import logging
-import urllib3
-from typing import Any, Callable, Optional, AsyncIterator as AsyncIteratorType
+from typing import Any, Callable, Union, Optional, AsyncIterator as AsyncIteratorType
+import trio  # type: ignore
+import urllib3  # type: ignore
 
 import requests
-from requests.models import CONTENT_CHUNK_SIZE
 
+from azure.core.exceptions import (
+    ServiceRequestError,
+    ServiceResponseError
+)
 from .base import HttpRequest
 from .base_async import (
     AsyncHttpTransport,
@@ -40,21 +43,19 @@ from .base_async import (
     _ResponseStopIteration,
     _iterate_response_content)
 from .requests_basic import RequestsTransport, RequestsTransportResponse
-from azure.core.exceptions import (
-    ServiceRequestError,
-    ServiceResponseError,
-    raise_with_traceback
-)
 
 
 _LOGGER = logging.getLogger(__name__)
 
 
-import trio
-
-
 class TrioStreamDownloadGenerator(AsyncIterator):
+    """Generator for streaming response data.
 
+    :param response: The response object.
+    :param int block_size: Number of bytes to read into memory.
+    :param generator iter_content_func: Iterator for response data.
+    :param int content_length: size of body in bytes.
+    """
     def __init__(self, response: requests.Response, block_size: int) -> None:
         self.response = response
         self.block_size = block_size
@@ -65,35 +66,43 @@ class TrioStreamDownloadGenerator(AsyncIterator):
         return self.content_length
 
     async def __anext__(self):
-        try:
-            chunk = await trio.run_sync_in_worker_thread(
-                _iterate_response_content,
-                self.iter_content_func,
-            )
-            if not chunk:
-                raise _ResponseStopIteration()
-            return chunk
-        except _ResponseStopIteration:
-            self.response.close()
-            raise StopAsyncIteration()
-        except Exception as err:
-            _LOGGER.warning("Unable to stream download: %s", err)
-            self.response.close()
-            raise
+        retry_active = True
+        retry_total = 3
+        while retry_active:
+            try:
+                chunk = await trio.run_sync_in_worker_thread(
+                    _iterate_response_content,
+                    self.iter_content_func,
+                )
+                if not chunk:
+                    raise _ResponseStopIteration()
+                return chunk
+            except _ResponseStopIteration:
+                self.response.close()
+                raise StopAsyncIteration()
+            except ServiceResponseError:
+                retry_total -= 1
+                if retry_total <= 0:
+                    retry_active = False
+                continue
+            except Exception as err:
+                _LOGGER.warning("Unable to stream download: %s", err)
+                self.response.close()
+                raise
 
-class TrioRequestsTransportResponse(AsyncHttpResponse, RequestsTransportResponse):
-
-    def stream_download(self) -> AsyncIteratorType[bytes]:
-        """Generator for streaming request body data.
-
-        :param callback: Custom callback for monitoring progress.
-        :param int chunk_size:
+class TrioRequestsTransportResponse(AsyncHttpResponse, RequestsTransportResponse):  # type: ignore
+    """Asynchronous streaming of data from the response.
+    """
+    def stream_download(self) -> AsyncIteratorType[bytes]:  # type: ignore
+        """Generator for streaming response data.
         """
-        return TrioStreamDownloadGenerator(self.internal_response, self.block_size)
+        return TrioStreamDownloadGenerator(self.internal_response, self.block_size) # type: ignore
 
 
 class TrioRequestsTransport(RequestsTransport, AsyncHttpTransport):  # type: ignore
-
+    """Identical implementation as the synchronous RequestsTransport wrapped in a class with
+     asynchronous methods. Uses the third party trio event loop.
+    """
     async def __aenter__(self):
         return super(TrioRequestsTransport, self).__enter__()
 
@@ -105,17 +114,23 @@ class TrioRequestsTransport(RequestsTransport, AsyncHttpTransport):  # type: ign
 
     async def send(self, request: HttpRequest, **kwargs: Any) -> AsyncHttpResponse:  # type: ignore
         """Send the request using this HTTP sender.
+
+        :param request: The HttpRequest
+        :type request: ~azure.core.pipeline.transport.HttpRequest
+        :param kwargs: Any keyword arguments
+        :return: The AsyncHttpResponse
+        :rtype: ~azure.core.pipeline.transport.AsyncHttpResponse
         """
         self.open()
         trio_limiter = kwargs.get("trio_limiter", None)
         response = None
-        error = None
+        error = None # type: Optional[Union[ServiceRequestError, ServiceResponseError]]
         if self.config.proxy_policy and 'proxies' not in kwargs:
             kwargs['proxies'] = self.config.proxy_policy.proxies
         try:
             response = await trio.run_sync_in_worker_thread(
                 functools.partial(
-                    self.session.request,
+                    self.session.request, # type: ignore
                     request.method,
                     request.url,
                     headers=request.headers,
