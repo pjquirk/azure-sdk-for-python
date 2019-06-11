@@ -1,7 +1,5 @@
-pool:
-  name: 'Default'
-
-steps:
-  - script: |
-      echo 'Hellow world'
-    displayName: 'Say hello'
+jobs:
+- job: Build
+  pool: Default
+  steps:
+  - script: echo 'hello world'
